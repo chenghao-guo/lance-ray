@@ -57,7 +57,7 @@ results = updated_dataset.scanner(
 | `name` | `str`, optional | Index name, auto-generated if not provided |
 | `num_workers` | `int`, optional | Number of Ray worker nodes to use, default is 4 |
 | `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset |
-| `ray_options` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
+| `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
 | `**kwargs` | `Any` | Additional arguments passed to `create_scalar_index` |
 
 ## Return Value
@@ -128,6 +128,6 @@ updated_dataset = lr.create_scalar_index(
    column="text",
    index_type="INVERTED",
    num_workers=4,
-   ray_options={"num_cpus": 2, "resources": {"custom_resource": 1}}
+   ray_remote_args={"num_cpus": 2, "resources": {"custom_resource": 1}}
 )
 ```

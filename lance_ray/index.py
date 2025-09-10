@@ -255,7 +255,7 @@ def create_scalar_index(
     name: Optional[str] = None,
     num_workers: int = 4,
     storage_options: Optional[dict[str, str]] = None,
-    ray_options: Optional[dict[str, Any]] = None,
+    ray_remote_args: Optional[dict[str, Any]] = None,
     **kwargs: Any,
 ) -> "lance.LanceDataset":
     """
@@ -272,7 +272,7 @@ def create_scalar_index(
         name: Name of the index (generated if None)
         num_workers: Number of Ray workers to use
         storage_options: Storage options for the dataset
-        ray_options: Options for Ray tasks (e.g., num_cpus, resources)
+        ray_remote_args: Options for Ray tasks (e.g., num_cpus, resources)
         **kwargs: Additional arguments to pass to create_scalar_index
 
     Returns:
@@ -393,8 +393,8 @@ def create_scalar_index(
 
     # Basic Ray task options
     task_options = {"num_cpus": 1}
-    if ray_options:
-        task_options.update(ray_options)
+    if ray_remote_args:
+        task_options.update(ray_remote_args)
 
     # Phase 1: Fragment index creation (completed by Ray tasks)
     # Each Ray task calls create_scalar_index for its assigned fragments

@@ -296,7 +296,7 @@ class TestDistributedIndexing:
                 num_workers=2,
             )
 
-    def test_build_distributed_index_with_ray_options(self, multi_fragment_lance_dataset):
+    def test_build_distributed_index_with_ray_remote_args(self, multi_fragment_lance_dataset):
         """Test building distributed index with Ray options."""
         dataset_uri = multi_fragment_lance_dataset
 
@@ -306,7 +306,7 @@ class TestDistributedIndexing:
             column="text",
             index_type="INVERTED",
             num_workers=2,
-            ray_options={"num_cpus": 1},
+            ray_remote_args={"num_cpus": 1},
         )
 
         # Verify the index was created
