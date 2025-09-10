@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 Demonstration of distributed text indexing with PR #4578 enhancements.
-
 This example shows how to use the enhanced distributed text indexing functionality
-that leverages the new API introduced in PR #4578, including:
-- execute_uncommitted() for fragment-level index creation
-- merge_index_metadata() for combining distributed index metadata
+that leverages the new API
 
 Requirements:
 - ray

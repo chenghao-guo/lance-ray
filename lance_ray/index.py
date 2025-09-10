@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
-import os
 import re
 import time
 import uuid
@@ -10,9 +9,9 @@ from typing import Any, Optional, Union
 
 import lance
 import pyarrow as pa
-import ray
 from lance.dataset import Index, LanceDataset
 from packaging import version
+from ray.util.multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
@@ -155,92 +154,88 @@ def generate_default_index_name(column: str, index_type: str, dataset: Optional[
     return base_name
 
 
-@ray.remote
-def _build_fragment_index_task(
+def _handle_fragment_index(
     dataset_uri: str,
     column: str,
-    fragment_ids: list[int],
-    index_type: str = "INVERTED",
-    name: Optional[str] = None,
-    fragment_uuid: Optional[str] = None,
+    index_type: str,
+    name: str,
+    fragment_uuid: str,
     storage_options: Optional[dict[str, str]] = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+):
     """
-    Ray remote task for building fragment index using the distributed API.
-
-    This task calls create_scalar_index directly for specific fragments.
-    After execution, fragment-level indices are automatically built.
-
-    Args:
-        dataset_uri: URI of the Lance dataset
-        column: Column name to index
-        fragment_ids: List of fragment IDs to build index for
-        index_type: Type of index to build ("INVERTED" or "FTS")
-        name: Name of the index
-        fragment_uuid: UUID for the fragment index
-        storage_options: Storage options for the dataset
-        **kwargs: Additional arguments to pass to create_scalar_index
-
-    Returns:
-        Dictionary with status and result information
+    Create a function to handle fragment index building for use with Pool.
+    This function returns a callable that can be used with Pool.map_async
+    to build indices for specific fragments.
     """
-    try:
-        # Basic input validation
-        if not fragment_ids:
-            raise ValueError("fragment_ids cannot be empty")
+    def func(fragment_ids: list[int]) -> dict[str, Any]:
+        """
+        Handle fragment index building using the distributed API.
 
-        # Validate fragment_id ranges
-        for fragment_id in fragment_ids:
-            if fragment_id < 0 or fragment_id > 0xFFFFFFFF:
-                raise ValueError(f"Invalid fragment_id: {fragment_id}")
+        This function calls create_scalar_index directly for specific fragments.
+        After execution, fragment-level indices are automatically built.
 
-        # Load dataset
-        dataset = LanceDataset(dataset_uri, storage_options=storage_options)
+        Args:
+            fragment_ids: List of fragment IDs to build index for
 
-        if name is None:
-            name = generate_default_index_name(column, index_type, dataset)
+        Returns:
+            Dictionary with status and result information
+        """
+        try:
+            # Basic input validation
+            if not fragment_ids:
+                raise ValueError("fragment_ids cannot be empty")
 
-        # Validate fragments exist
-        available_fragments = {f.fragment_id for f in dataset.get_fragments()}
-        invalid_fragments = set(fragment_ids) - available_fragments
-        if invalid_fragments:
-            raise ValueError(f"Fragment IDs {invalid_fragments} do not exist")
+            # Validate fragment_id ranges
+            for fragment_id in fragment_ids:
+                if fragment_id < 0 or fragment_id > 0xFFFFFFFF:
+                    raise ValueError(f"Invalid fragment_id: {fragment_id}")
 
-        # Use the distributed index building API - Phase 1: Fragment index creation
-        logger.info(f"Building distributed index for fragments {fragment_ids} using create_scalar_index")
+            # Load dataset
+            dataset = LanceDataset(dataset_uri, storage_options=storage_options)
 
-        # Call create_scalar_index directly - no return value expected
-        # After execution, fragment-level indices are automatically built
-        dataset.create_scalar_index(
-            column=column,
-            index_type=index_type,
-            name=name,
-            replace=False,
-            fragment_uuid=fragment_uuid,
-            fragment_ids=fragment_ids,
-            **kwargs
-        )
+            # Validate fragments exist
+            available_fragments = {f.fragment_id for f in dataset.get_fragments()}
+            invalid_fragments = set(fragment_ids) - available_fragments
+            if invalid_fragments:
+                raise ValueError(f"Fragment IDs {invalid_fragments} do not exist")
 
-        # Get field ID for the indexed column
-        field_id = dataset.schema.get_field_index(column)
+            # Use the distributed index building API - Phase 1: Fragment index creation
+            logger.info(f"Building distributed index for fragments {fragment_ids} using create_scalar_index")
 
-        logger.info(f"Fragment index created successfully for fragments {fragment_ids}")
+            # Call create_scalar_index directly - no return value expected
+            # After execution, fragment-level indices are automatically built
+            dataset.create_scalar_index(
+                column=column,
+                index_type=index_type,
+                name=name,
+                replace=False,
+                fragment_uuid=fragment_uuid,
+                fragment_ids=fragment_ids,
+                **kwargs
+            )
 
-        return {
-            "status": "success",
-            "fragment_ids": fragment_ids,
-            "fields": [field_id],
-            "uuid": fragment_uuid,
-        }
+            # Get field ID for the indexed column
+            field_id = dataset.schema.get_field_index(column)
 
-    except Exception as e:
-        logger.error(f"Fragment index task failed for fragments {fragment_ids}: {e}")
-        return {
-            "status": "error",
-            "fragment_ids": fragment_ids,
-            "error": str(e),
-        }
+            logger.info(f"Fragment index created successfully for fragments {fragment_ids}")
+
+            return {
+                "status": "success",
+                "fragment_ids": fragment_ids,
+                "fields": [field_id],
+                "uuid": fragment_uuid,
+            }
+
+        except Exception as e:
+            logger.error(f"Fragment index task failed for fragments {fragment_ids}: {e}")
+            return {
+                "status": "error",
+                "fragment_ids": fragment_ids,
+                "error": str(e),
+            }
+
+    return func
 
 def merge_index_metadata_compat(dataset, index_id, default_index_type="INVERTED"):
     try:
@@ -317,34 +312,8 @@ def create_scalar_index(
     if index_type not in ["INVERTED", "FTS"]:
         raise ValueError(f"Index type must be 'INVERTED' or 'FTS', not '{index_type}'")
 
-    # Initialize Ray if needed
-    if not ray.is_initialized():
-        try:
-            if "RAY_ADDRESS" in os.environ:
-                # Connect to existing Ray cluster
-                ray.init(
-                    address=os.environ["RAY_ADDRESS"],
-                    ignore_reinit_error=True,
-                    runtime_env={
-                        "env_vars": {
-                            "TOSFS_LOGGING_LEVEL": "INFO",
-                            "LANCE_LOG": "DEBUG",
-                        }
-                    },
-                )
-            else:
-                # Start local Ray cluster
-                ray.init(
-                    ignore_reinit_error=True,
-                    runtime_env={
-                        "env_vars": {
-                            "TOSFS_LOGGING_LEVEL": "INFO",
-                            "LANCE_LOG": "DEBUG",
-                        }
-                    },
-                )
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize Ray: {e}") from e
+    # Note: Ray initialization is now handled by the Pool, following the pattern from io.py
+    # This removes the need for explicit ray.init() calls
 
     # Load dataset
     if isinstance(dataset, str):
@@ -391,35 +360,36 @@ def create_scalar_index(
         fragments, num_workers, logger
     )
 
-    # Basic Ray task options
-    task_options = {"num_cpus": 1}
-    if ray_remote_args:
-        task_options.update(ray_remote_args)
+    # Phase 1: Fragment index creation using Pool pattern (similar to io.py)
+    # Use Pool to distribute work instead of direct Ray task submission
+    pool = Pool(processes=num_workers, ray_remote_args=ray_remote_args)
 
-    # Phase 1: Fragment index creation (completed by Ray tasks)
-    # Each Ray task calls create_scalar_index for its assigned fragments
-    # After task completion, fragment-level indices are automatically built
+    # Create the fragment handler function
+    fragment_handler = _handle_fragment_index(
+        dataset_uri=dataset_uri,
+        column=column,
+        index_type=index_type,
+        name=name,
+        fragment_uuid=index_id,
+        storage_options=storage_options,
+        **kwargs,
+    )
 
-    # Submit tasks
-    tasks = []
-    for batch in fragment_batches:
-        task = _build_fragment_index_task.options(**task_options).remote(
-            dataset_uri=dataset_uri,
-            column=column,
-            fragment_ids=batch,
-            index_type=index_type,
-            name=name,
-            fragment_uuid=index_id,
-            storage_options=storage_options,
-            **kwargs,
-        )
-        tasks.append(task)
+    # Submit tasks using Pool.map_async
+    rst_futures = pool.map_async(
+        fragment_handler,
+        fragment_batches,
+        chunksize=1,
+    )
 
     # Wait for results
     try:
-        results = ray.get(tasks)
+        results = rst_futures.get()
     except Exception as e:
+        pool.close()
         raise RuntimeError(f"Failed to complete distributed index building: {e}") from e
+    finally:
+        pool.close()
 
     # Check for failures
     failed_results = [r for r in results if r["status"] == "error"]
