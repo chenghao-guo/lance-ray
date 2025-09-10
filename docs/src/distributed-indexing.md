@@ -3,51 +3,35 @@
 
 Lance-Ray provides distributed index building functionality that leverages Ray's distributed computing capabilities to efficiently create text indices for Lance datasets. This is particularly useful for large-scale datasets as it can distribute index building work across multiple Ray worker nodes.
 
-## New Features Highlights (Based on PR #4578)
+## New Distributed APIs
 
-The latest version of distributed indexing functionality is based on interface improvements from Lance PR #4578, providing more efficient and reliable distributed index building capabilities:
+`create_scalar_index()` - Distributedly create scalar index index using ray. Currently only Inverted/FTS are supported. Will add more index type support in the future.
 
-### Key Improvements
-
-1. **New Distributed APIs**:
-   - `create_scalar_index()` - Distributedly create fts index index using ray
-
-2. **Three-Phase Workflow**:
-   - **Split and Parallel Phase**: Distribute dataset fragments to different Ray worker nodes
-   - **Merge Phase**: Collect and merge index metadata from all worker nodes
-   - **Commit Phase**: Atomically commit index information to the dataset
-
-3. **Backward Compatibility**:
-   - Automatically detect availability of new APIs
-   - Gracefully fallback to traditional methods when new APIs are unavailable
-   - Ensure proper functionality across different Lance versions
-
-## Overview
-
+### How It Works
 The `create_scalar_index` function allows you to create full-text search indices for Lance datasets using the Ray distributed computing framework. This function distributes the index building process across multiple Ray worker nodes, with each node responsible for building indices for a subset of dataset fragments. These indices are then merged and committed as a single index.
 
-## Usage
+**Backward Compatibility**:
+   - Automatically detect availability of new APIs across different Lance versions
+   - Gracefully fallback to raise tips when new APIs are unavailable
+
+
+**`create_scalar_index`**
 
 ```python
-import lance_ray as lr
+def create_scalar_index(
+    dataset: Union[str, "lance.LanceDataset"],
+    column: str,
+    index_type: str,
+    name: Optional[str] = None,
+    num_workers: int = 4,
+    storage_options: Optional[dict[str, str]] = None,
+    ray_remote_args: Optional[dict[str, Any]] = None,
+    **kwargs: Any,
+) -> "lance.LanceDataset":
 
-# Build distributed index
-updated_dataset = lr.create_scalar_index(
-   dataset="path/to/dataset",  # or lance.LanceDataset object
-   column="text_column",  # Text column name to index
-   index_type="INVERTED",  # Index type, supports "INVERTED" or "FTS"
-   name="my_text_index",  # Optional, index name
-   num_workers=4,  # Optional, number of Ray worker nodes
-)
-
-# Use index for search
-results = updated_dataset.scanner(
-   full_text_query="search term",
-   columns=["id", "text_column"]
-).to_table()
 ```
 
-## Parameters
+### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -60,22 +44,10 @@ results = updated_dataset.scanner(
 | `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
 | `**kwargs` | `Any` | Additional arguments passed to `create_scalar_index` |
 
-## Return Value
+### Return Value
 
 The function returns an updated Lance dataset with the newly created index.
 
-## How It Works
-
-1. The function first validates input parameters and initializes Ray (if not already initialized)
-2. It then distributes dataset fragments across multiple Ray worker nodes
-3. Each worker node builds indices for its assigned fragments
-4. Finally, all fragment indices are merged and committed as a single index to the dataset
-
-## Performance Considerations
-
-- Increasing `num_workers` can improve index building speed, but requires more computational resources
-- For very large datasets, it's recommended to use more worker nodes
-- If `num_workers` is greater than the number of fragments, it will be automatically adjusted to match the fragment count
 
 ## Examples
 
@@ -131,3 +103,9 @@ updated_dataset = lr.create_scalar_index(
    ray_remote_args={"num_cpus": 2, "resources": {"custom_resource": 1}}
 )
 ```
+
+### Performance Considerations
+
+- For very large datasets, it's recommended to use more powerful CPU/memory ray worker nodes. Increasing `num_workers` can improve index building speed, but requires more computational nodes.
+- Too many num_workers can cause large number of partitions, which cause FTS queries slowness as lots of index partitions need to be loaded when searching.
+- If `num_workers` is greater than the number of fragments, it will be automatically adjusted to match the fragment count
