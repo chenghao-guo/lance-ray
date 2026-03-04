@@ -206,8 +206,20 @@ class LanceFragmentWriter:
         # Convert dict/numpy arrays to pyarrow table if needed
         if isinstance(batch, dict):
             batch = pa.Table.from_pydict(batch)
-        elif hasattr(batch, "__dataframe__"):  # pandas DataFrame
-            batch = pa.Table.from_pandas(batch)
+        else:
+            # Only convert when the input is an actual pandas DataFrame.
+            # Some objects (including pyarrow.Table) may implement the
+            # dataframe interchange protocol `__dataframe__`, but they are
+            # not pandas DataFrames. Using `hasattr(..., "__dataframe__")`
+            # incorrectly routes them through `Table.from_pandas` and causes
+            # errors. Perform a strict isinstance check instead.
+            try:
+                from pandas import DataFrame as _PandasDataFrame  # type: ignore
+            except Exception:
+                _PandasDataFrame = None  # type: ignore
+
+            if _PandasDataFrame is not None and isinstance(batch, _PandasDataFrame):
+                batch = pa.Table.from_pandas(batch)
 
         transformed = self.transform(batch)
         if not isinstance(transformed, Generator):

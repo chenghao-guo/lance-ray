@@ -142,6 +142,10 @@ def write_lance(
     namespace_properties: Optional[dict[str, str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
+    # Streaming parameters (only effective when stream=True)
+    stream: bool = False,
+    batch_size: Optional[int] = None,
+    resume_rows: int = 0,
 ) -> None:
     """Write the dataset to a Lance dataset.
 
@@ -188,27 +192,177 @@ def write_lance(
             Used together with namespace_properties and table_id.
         namespace_properties: Properties for connecting to the namespace.
             Used together with namespace_impl and table_id.
+        stream: Enable incremental batch streaming write. Default False.
+        batch_size: Batch size when streaming. If None, defaults to 1024.
+        resume_rows: Number of leading rows to skip when streaming (for resume).
     """
     _validate_write_args(uri, namespace_impl, table_id, mode)
 
-    datasink = LanceDatasink(
-        uri,
-        table_id=table_id,
-        schema=schema,
-        mode=mode,
-        min_rows_per_file=min_rows_per_file,
+    # Fast path: non-streaming write using the Datasink API.
+    if not stream:
+        datasink = LanceDatasink(
+            uri,
+            table_id=table_id,
+            schema=schema,
+            mode=mode,
+            min_rows_per_file=min_rows_per_file,
+            max_rows_per_file=max_rows_per_file,
+            data_storage_version=data_storage_version,
+            storage_options=storage_options,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+        )
+
+        ds.write_datasink(
+            datasink,
+            ray_remote_args=ray_remote_args or {},
+            concurrency=concurrency,
+        )
+        return
+
+    # Streaming path: commit one fragment per batch to minimize memory usage.
+    import lance
+
+    if (namespace_impl is not None or namespace_properties is not None) and table_id:
+        raise ValueError(
+            "Streaming write with 'namespace_impl' + 'table_id' is not supported; "
+            "use non-stream mode or provide a direct 'uri'.",
+        )
+
+    if uri is None:
+        raise ValueError(
+            "Streaming write requires 'uri' to be provided when no namespace is used.",
+        )
+
+    dest_uri: str = uri
+    dest_exists = False
+    dest_version: Optional[int] = None
+
+    try:
+        _dest = lance.LanceDataset(dest_uri, storage_options=storage_options)
+        dest_exists = True
+        dest_version = _dest.version
+    except Exception:
+        dest_exists = False
+        dest_version = None
+
+    # Enforce mode semantics.
+    if mode == "create" and dest_exists:
+        raise ValueError("Destination exists but mode='create' was specified.")
+    if mode == "append" and not dest_exists:
+        raise ValueError("Destination does not exist but mode='append' was specified.")
+
+    from .fragment import LanceFragmentWriter
+
+    effective_batch_size = batch_size if batch_size is not None else 1024
+
+    writer = LanceFragmentWriter(
+        uri=dest_uri,
+        schema=schema,  # if None, writer infers from first batch (preserves Arrow metadata)
         max_rows_per_file=max_rows_per_file,
+        max_rows_per_group=min_rows_per_file,  # keep naming aligned with v1 semantics
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        namespace_impl=namespace_impl,
-        namespace_properties=namespace_properties,
+        namespace_impl=None,
+        namespace_properties=None,
+        table_id=None,
     )
 
-    ds.write_datasink(
-        datasink,
-        ray_remote_args=ray_remote_args or {},
-        concurrency=concurrency,
-    )
+    rows_seen = 0
+    first_commit_done = False
+
+    for batch in ds.iter_batches(
+        batch_size=effective_batch_size, batch_format="pyarrow"
+    ):
+        # Convert to pyarrow.Table if needed.
+        tbl = batch if isinstance(batch, pa.Table) else pa.Table.from_pydict(batch)
+
+        # Apply resume_rows skipping across batches.
+        if resume_rows > rows_seen:
+            to_skip = min(resume_rows - rows_seen, tbl.num_rows)
+            rows_seen += to_skip
+            if to_skip >= tbl.num_rows:
+                # Whole batch skipped.
+                continue
+            tbl = tbl.slice(to_skip)
+
+        # Skip empty batches (possible after slicing).
+        if tbl.num_rows == 0:
+            continue
+
+        # Write this batch as one fragment and collect metadata.
+        frag_tbl = writer(tbl)
+        fragments: list[Any] = []
+        schema_obj: Optional[pa.Schema] = None
+        frag_col = frag_tbl.column("fragment").to_pylist()
+        sch_col = frag_tbl.column("schema").to_pylist()
+        for frag_bytes, schema_bytes in zip(frag_col, sch_col, strict=False):
+            fragment = pickle.loads(frag_bytes)
+            fragments.append(fragment)
+            schema_obj = pickle.loads(schema_bytes)
+
+        # Commit after each batch.
+        if not first_commit_done:
+            # First commit: respect mode.
+            if mode in ("create", "overwrite") or not dest_exists:
+                op = LanceOperation.Overwrite(schema_obj, fragments)
+                LanceDataset.commit(
+                    dest_uri,
+                    op,
+                    read_version=None,
+                    storage_options=storage_options,
+                )
+                first_commit_done = True
+                dest_exists = True
+                try:
+                    _dest = lance.LanceDataset(
+                        dest_uri, storage_options=storage_options
+                    )
+                    dest_version = _dest.version
+                except Exception:
+                    dest_version = None
+            elif mode == "append":
+                op = LanceOperation.Append(fragments)
+                LanceDataset.commit(
+                    dest_uri,
+                    op,
+                    read_version=dest_version,
+                    storage_options=storage_options,
+                )
+                first_commit_done = True
+                try:
+                    _dest = lance.LanceDataset(
+                        dest_uri, storage_options=storage_options
+                    )
+                    dest_version = _dest.version
+                except Exception:
+                    pass
+            else:
+                # Fallback: overwrite.
+                op = LanceOperation.Overwrite(schema_obj, fragments)
+                LanceDataset.commit(
+                    dest_uri,
+                    op,
+                    read_version=None,
+                    storage_options=storage_options,
+                )
+                first_commit_done = True
+        else:
+            # Subsequent commits always append.
+            op = LanceOperation.Append(fragments)
+            LanceDataset.commit(
+                dest_uri,
+                op,
+                read_version=dest_version,
+                storage_options=storage_options,
+            )
+            try:
+                _dest = lance.LanceDataset(dest_uri, storage_options=storage_options)
+                dest_version = _dest.version
+            except Exception:
+                pass
+
+        rows_seen += tbl.num_rows
 
 
 def _handle_fragment(

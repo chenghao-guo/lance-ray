@@ -228,11 +228,155 @@ def _read_fragments(
 ) -> Iterator[pa.Table]:
     """Read Lance fragments in batches.
 
+    This enhanced reader detects Lance blob-encoded columns and reconstructs
+    raw bytes using the :meth:`LanceDataset.take_blobs` API, returning
+    :class:`pyarrow.LargeBinaryArray` columns instead of the default
+    struct-based descriptors.
+
+    Row ordering is preserved by using per-batch row IDs.
+
     NOTE: Use fragment ids, instead of fragments as parameter, because pickling
-    LanceFragment is expensive.
+    :class:`lance.LanceFragment` is expensive.
     """
+    # Resolve fragments
     fragments = [lance_ds.get_fragment(id) for id in fragment_ids]
-    scanner_options["fragments"] = fragments
-    scanner = lance_ds.scanner(**scanner_options)
+
+    # Copy scanner options so we can safely mutate
+    scan_opts: dict[str, Any] = dict(scanner_options)
+    scan_opts["fragments"] = fragments
+
+    # Detect blob columns from the dataset schema and requested projection
+    ds_schema: pa.Schema = lance_ds.schema
+    requested_columns = scan_opts.get("columns")
+    # Map column name -> blob kind ("legacy" or "v2")
+    blob_columns: dict[str, str] = {}
+
+    def _is_blob_field(f: pa.Field) -> Optional[str]:
+        """Detect Lance blob columns.
+
+        Returns:
+            "v2" for blob v2 extension columns,
+            "legacy" for legacy metadata-based blob columns,
+            or None if the field is not a blob.
+        """
+        field_type = f.type
+
+        # Blob v2: extension type `lance.blob.v2`
+        if isinstance(field_type, pa.ExtensionType):
+            ext_name = getattr(field_type, "extension_name", None)
+            if ext_name == "lance.blob.v2":
+                return "v2"
+
+        # Legacy: LargeBinary with field metadata {"lance-encoding:blob": "true"}
+        try:
+            is_large_bin = field_type == pa.large_binary()
+        except Exception:
+            is_large_bin = False
+        if not is_large_bin:
+            return None
+
+        meta = f.metadata
+        if meta is None:
+            return None
+
+        # pyarrow may store metadata keys/values as str
+        if (meta.get("lance-encoding:blob") == "true") or (
+            meta.get(b"lance-encoding:blob") == b"true"
+        ):
+            return "legacy"
+
+        return None
+
+    # Build list of blob columns to reconstruct, honoring column projection
+    ds_field_names = ds_schema.names
+    for idx, name in enumerate(ds_field_names):
+        field = ds_schema.field(idx)
+        kind = _is_blob_field(field)
+        if kind is None:
+            continue
+        if requested_columns is None:
+            blob_columns[name] = kind
+        elif isinstance(requested_columns, list):
+            if name in requested_columns:
+                blob_columns[name] = kind
+        elif isinstance(requested_columns, dict) and name in requested_columns:
+            # If columns are SQL expressions, only reconstruct if explicitly requested
+            blob_columns[name] = kind
+
+    # If blob columns are present, ensure row IDs are included for reconstruction
+    if blob_columns:
+        scan_opts["with_row_id"] = True
+
+    scanner = lance_ds.scanner(**scan_opts)
+
     for batch in scanner.to_reader():
-        yield pa.Table.from_batches([batch])
+        # Fast path: no blob columns requested in this scan
+        if not blob_columns:
+            yield pa.Table.from_batches([batch])
+            continue
+
+        # Build a table so we can manipulate columns easily
+        table = pa.Table.from_batches([batch])
+
+        # Extract row IDs used to reconstruct bytes in the same order
+        if "_rowid" not in table.column_names:
+            # Safety: if row ids are missing for any reason, fall back to original
+            yield table
+            continue
+        row_ids = table.column("_rowid").to_pylist()
+
+        # For each blob column, reconstruct a LargeBinary array
+        for col, kind in blob_columns.items():
+            if col not in table.column_names:
+                # Column not projected in this batch
+                continue
+
+            # The scanned representation may be a struct descriptor or extension-backed
+            # array. We only rely on the null bitmap: None -> null bytes; non-null ->
+            # fetch bytes via LanceDataset.take_blobs.
+            desc_py = table.column(col).to_pylist()
+
+            # Fetch BlobFile handles in batch order
+            blob_files = lance_ds.take_blobs(col, ids=row_ids)
+
+            # Convert BlobFile -> bytes, respecting nulls
+            values: list[Optional[bytes]] = []
+            for i, desc in enumerate(desc_py):
+                if desc is None:
+                    values.append(None)
+                    continue
+                # Backward compatibility: older legacy blob layouts may encode
+                # nulls as a sentinel struct {position: 1, size: 0} instead of
+                # using the Arrow null bitmap. Treat this sentinel as null for
+                # metadata-based blob columns only.
+                if kind == "legacy" and isinstance(desc, dict):
+                    pos = desc.get("position")
+                    size = desc.get("size")
+                    if pos == 1 and size == 0:
+                        values.append(None)
+                        continue
+                with blob_files[i] as bf:
+                    values.append(bf.read())
+
+            # Construct LargeBinary array for Ray, preserving legacy metadata only
+            # for metadata-based blob columns. Blob v2 extension columns are exposed
+            # as plain LargeBinary bytes.
+            new_arr = pa.array(values, type=pa.large_binary())
+            ds_field_index = ds_schema.get_field_index(col)
+            ds_field = ds_schema.field(ds_field_index)
+            nullable = ds_field.nullable
+            metadata = ds_field.metadata if kind == "legacy" else None
+            new_field = pa.field(
+                col, pa.large_binary(), nullable=nullable, metadata=metadata
+            )
+            table = table.set_column(
+                table.schema.get_field_index(col),
+                new_field,
+                pa.chunked_array([new_arr]),
+            )
+
+        # Drop helper row ID column before returning
+        if "_rowid" in table.column_names:
+            table = table.drop_columns(["_rowid"])
+
+        yield table
