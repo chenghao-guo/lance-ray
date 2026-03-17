@@ -80,7 +80,9 @@ class TestLanceFragmentWriterCommitter:
         ds = lance.dataset(tmp_path)
         assert ds.count_rows() == 5
         tbl = ds.to_table()
-        assert tbl.column("doubled").to_pylist() == [0, 2, 4, 6, 8]
+        indices = pa.compute.sort_indices(tbl, sort_keys=[("id", "ascending")])
+        tbl_sorted = pa.compute.take(tbl, indices)
+        assert tbl_sorted.column("doubled").to_pylist() == [0, 2, 4, 6, 8]
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fragment_writer_append_mode(self, tmp_path: Path):
