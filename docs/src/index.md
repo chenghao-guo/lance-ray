@@ -13,6 +13,7 @@ enabling scalable data processing workflows with optimal performance.
 - **Schema Validation**: Automatic schema compatibility checking between Ray and Lance
 - **Flexible Filtering**: Support for complex filtering pushdown on distributed Lance data
 - **Data Evolution**: Support for data evolution to add new columns and distributedly backfill data using a Ray UDF
+- **Index Maintenance**: Incremental index updates and distributed dataset compaction
 - **Catalog Integration**: Support for working with Lance datasets stored in various catalog services (e.g. Hive MetaStore, Iceberg REST Catalog, Unity, Gravitino, AWS Glue, etc.)
 
 ## Quickstart

@@ -90,18 +90,23 @@ The following vector index types are supported for distributed building:
 
 ```python
 def create_index(
-    uri: Union[str, "lance.LanceDataset"],
-    column: str,
-    index_type: str,
+    uri: Optional[Union[str, "lance.LanceDataset"]] = None,
+    column: str = "",
+    index_type: str = "",
     name: Optional[str] = None,
     *,
     replace: bool = True,
     num_workers: int = 4,
     storage_options: Optional[dict[str, str]] = None,
+    namespace_impl: Optional[str] = None,
+    namespace_properties: Optional[dict[str, str]] = None,
+    table_id: Optional[list[str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     metric: str = "l2",
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
+    ivf_centroids: Optional["pyarrow.Array"] = None,
+    pq_codebook: Optional["pyarrow.Array"] = None,
     **kwargs: Any,
 ) -> "lance.LanceDataset":
 ```
@@ -110,22 +115,68 @@ def create_index(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `uri` | `str` or `lance.LanceDataset` | Lance dataset or its URI |
+| `uri` | `str` or `lance.LanceDataset`, optional | Lance dataset object, or its URI. Either `uri` OR (`namespace_impl` + `table_id`) must be provided when using URI mode. If you pass a `lance.LanceDataset` object, namespace parameters are ignored. |
 | `column` | `str` | Vector column name to index |
 | `index_type` | `str` | Vector index type (e.g., `"IVF_PQ"`, `"IVF_SQ"`, `"IVF_FLAT"`) |
 | `name` | `str`, optional | Index name, auto-generated if not provided |
 | `replace` | `bool`, optional | Whether to replace existing index, default is `True` |
 | `num_workers` | `int`, optional | Number of Ray workers to use, default is 4 |
-| `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset |
+| `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset. These are merged with the storage options returned by the namespace (if any). |
+| `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
+| `namespace_properties` | `Dict[str, str]`, optional | Properties for connecting to the namespace |
+| `table_id` | `list[str]`, optional | The table identifier as a list of strings. Must be provided together with `namespace_impl`. |
 | `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
 | `metric` | `str`, optional | Distance metric to use (e.g., `"l2"`, `"cosine"`, `"dot"`, `"hamming"`), default is `"l2"` |
 | `num_partitions` | `int`, optional | Number of IVF partitions |
 | `num_sub_vectors` | `int`, optional | Number of PQ sub-vectors |
+| `ivf_centroids` | `pyarrow.Array`, optional | Pre-computed IVF centroids (advanced) |
+| `pq_codebook` | `pyarrow.Array`, optional | Pre-computed PQ codebook for PQ-based indices (advanced) |
 | `**kwargs` | `Any` | Additional arguments to pass (e.g., `sample_rate`) |
 
 #### Return Value
 
 The function returns an updated Lance dataset with the newly created vector index.
+
+### Index Optimization (Incremental Updates)
+
+`optimize_indices()` - Incrementally update existing indices for newly appended data.
+
+This is useful when you frequently append/overwrite data and want to restore search performance without rebuilding indices from scratch.
+
+#### `optimize_indices`
+
+```python
+def optimize_indices(
+    uri: Optional[str] = None,
+    *,
+    table_id: Optional[list[str]] = None,
+    indices: Optional[list[str]] = None,
+    num_indices_to_merge: int = 1,
+    retrain: bool = False,
+    storage_options: Optional[dict[str, str]] = None,
+    namespace_impl: Optional[str] = None,
+    namespace_properties: Optional[dict[str, str]] = None,
+    **kwargs: Any,
+) -> "lance.LanceDataset":
+```
+
+#### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `uri` | `str`, optional | Dataset URI. Either `uri` OR (`namespace_impl` + `table_id`) must be provided. |
+| `table_id` | `list[str]`, optional | The table identifier as a list of strings. Must be provided together with `namespace_impl`. |
+| `indices` | `list[str]`, optional | Index names to optimize. If not provided, all indices are optimized. |
+| `num_indices_to_merge` | `int`, optional | Number of delta indices to merge (default 1). Set to 0 to create a new delta index without merging. |
+| `retrain` | `bool`, optional | If `True`, retrain the whole index from current data (default `False`). |
+| `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset |
+| `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
+| `namespace_properties` | `Dict[str, str]`, optional | Properties for connecting to the namespace |
+| `**kwargs` | `Any` | Passed through to Lance `DatasetOptimizer.optimize_indices` |
+
+#### Return Value
+
+The function returns the Lance dataset instance (optimization is applied on storage).
 
 ## Examples
 
