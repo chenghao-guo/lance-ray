@@ -7,7 +7,7 @@ from lance.optimize import Compaction, CompactionOptions, CompactionTask
 from ray.util.multiprocessing import Pool
 
 from .utils import (
-    create_storage_options_provider,
+    get_namespace_kwargs,
     get_or_create_namespace,
     validate_uri_or_namespace,
 )
@@ -39,8 +39,7 @@ def _handle_compaction_task(
             Dictionary with status and result information
         """
         try:
-            # Create storage options provider in worker for credentials refresh
-            storage_options_provider = create_storage_options_provider(
+            namespace_kwargs = get_namespace_kwargs(
                 namespace_impl, namespace_properties, table_id
             )
 
@@ -48,7 +47,7 @@ def _handle_compaction_task(
             dataset = lance.LanceDataset(
                 dataset_uri,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
+                **namespace_kwargs,
             )
 
             logger.info(f"Executing compaction task for fragments {task.fragments}")
@@ -133,16 +132,13 @@ def compact_files(
         if describe_response.storage_options:
             merged_storage_options.update(describe_response.storage_options)
 
-    # Create storage options provider for local operations
-    storage_options_provider = create_storage_options_provider(
-        namespace_impl, namespace_properties, table_id
-    )
+    namespace_kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
 
     # Load dataset
     dataset = lance.LanceDataset(
         uri,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
     logger.info("Starting distributed compaction")

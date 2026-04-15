@@ -15,7 +15,7 @@ from ray.util.multiprocessing import Pool
 from .datasink import LanceDatasink
 from .datasource import LanceDatasource
 from .utils import (
-    create_storage_options_provider,
+    get_namespace_kwargs,
     has_namespace_params,
     validate_uri_or_namespace,
 )
@@ -382,16 +382,15 @@ def _handle_fragment(
     """
 
     def func(fragment_id: int):
-        # Create storage options provider in worker for credentials refresh
-        storage_options_provider = create_storage_options_provider(
+        namespace_kwargs = get_namespace_kwargs(
             namespace_impl, namespace_properties, table_id
         )
 
         lance_ds = LanceDataset(
             uri=uri,
             storage_options=storage_options,
-            storage_options_provider=storage_options_provider,
             version=read_version,
+            **namespace_kwargs,
         )
         fragment = lance_ds.get_fragment(fragment_id)
         fragment_meta, schema = fragment.merge_columns(
@@ -461,16 +460,13 @@ def add_columns(
     """
     storage_options = storage_options or {}
 
-    # Create storage options provider for local operations
-    storage_options_provider = create_storage_options_provider(
-        namespace_impl, namespace_properties, table_id
-    )
+    namespace_kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
 
     lance_ds = LanceDataset(
         uri=uri,
         storage_options=storage_options,
-        storage_options_provider=storage_options_provider,
         version=read_version,
+        **namespace_kwargs,
     )
     fragment_ids = [f.metadata.id for f in lance_ds.get_fragments()]
     pool = Pool(processes=concurrency, ray_remote_args=ray_remote_args)
@@ -517,7 +513,7 @@ def add_columns(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
 

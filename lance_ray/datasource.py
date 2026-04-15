@@ -9,7 +9,7 @@ from ray.data.context import DataContext
 from ray.data.datasource import Datasource
 from ray.data.datasource.datasource import ReadTask
 
-from .utils import array_split, create_storage_options_provider, get_or_create_namespace
+from .utils import array_split, get_namespace_kwargs, get_or_create_namespace
 
 if TYPE_CHECKING:
     import lance
@@ -83,9 +83,6 @@ class LanceDatasource(Datasource):
             dataset_options["namespace"] = self._namespace
             dataset_options["table_id"] = self._table_id
             dataset_options["storage_options"] = self._storage_options
-            # Note: lance.dataset() doesn't accept storage_options_provider.
-            # When namespace is provided, it handles credential refresh internally.
-            # For workers, we pass namespace_impl/properties to reconstruct the provider.
             self._lance_ds = lance.dataset(**dataset_options)
         return self._lance_ds
 
@@ -200,8 +197,7 @@ def _read_fragments_with_retry(
     scanner_options: dict[str, Any],
     retry_params: dict[str, Any],
 ) -> Iterator[pa.Table]:
-    # Reconstruct storage options provider on worker for credential refresh
-    storage_options_provider = create_storage_options_provider(
+    namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
     )
 
@@ -212,7 +208,7 @@ def _read_fragments_with_retry(
         version=version,
         storage_options=storage_options,
         serialized_manifest=manifest,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
     return call_with_retry(
@@ -332,31 +328,103 @@ def _read_fragments(
                 continue
 
             # The scanned representation may be a struct descriptor or extension-backed
-            # array. We only rely on the null bitmap: None -> null bytes; non-null ->
-            # fetch bytes via LanceDataset.take_blobs.
+            # array. We rely on the scan output to decide whether a given row is null,
+            # but we must be careful about how ``take_blobs`` aligns its results:
+            #
+            # - Legacy blob columns often return one handle per requested row ID
+            #   (including null rows).
+            # - Blob v2 currently *skips* null rows, returning fewer handles.
             desc_py = table.column(col).to_pylist()
 
             # Fetch BlobFile handles in batch order
             blob_files = lance_ds.take_blobs(col, ids=row_ids)
 
-            # Convert BlobFile -> bytes, respecting nulls
             values: list[Optional[bytes]] = []
-            for i, desc in enumerate(desc_py):
-                if desc is None:
-                    values.append(None)
-                    continue
-                # Backward compatibility: older legacy blob layouts may encode
-                # nulls as a sentinel struct {position: 1, size: 0} instead of
-                # using the Arrow null bitmap. Treat this sentinel as null for
-                # metadata-based blob columns only.
-                if kind == "legacy" and isinstance(desc, dict):
-                    pos = desc.get("position")
-                    size = desc.get("size")
-                    if pos == 1 and size == 0:
+
+            if len(blob_files) == len(desc_py):
+                # 1:1 alignment with requested rows (legacy behavior).
+                for desc, blob_file in zip(desc_py, blob_files, strict=False):
+                    if desc is None:
                         values.append(None)
                         continue
-                with blob_files[i] as bf:
-                    values.append(bf.read())
+
+                    if kind == "legacy" and isinstance(desc, dict):
+                        pos = desc.get("position")
+                        size = desc.get("size")
+                        if pos == 1 and size == 0:
+                            values.append(None)
+                            continue
+
+                    if kind == "v2" and isinstance(desc, dict):
+                        v2_pos = desc.get("position")
+                        v2_size = desc.get("size")
+                        v2_blob_id = desc.get("blob_id")
+                        v2_uri = desc.get("blob_uri")
+                        if (
+                            v2_pos == 0
+                            and v2_size == 0
+                            and v2_blob_id == 0
+                            and (v2_uri == "" or v2_uri is None)
+                        ):
+                            values.append(None)
+                            continue
+
+                    if kind != "legacy":
+                        if isinstance(desc, bytes | bytearray | memoryview):
+                            values.append(bytes(desc))
+                            continue
+                        if isinstance(desc, dict) and "bytes" in desc:
+                            values.append(bytes(desc["bytes"]))
+                            continue
+
+                    with blob_file as bf:
+                        values.append(bf.read())
+            else:
+                # Sparse alignment (blob v2 behavior): consume a handle only for
+                # non-null rows.
+                blob_iter = iter(blob_files)
+                for desc in desc_py:
+                    if desc is None:
+                        values.append(None)
+                        continue
+
+                    if kind == "legacy" and isinstance(desc, dict):
+                        pos = desc.get("position")
+                        size = desc.get("size")
+                        if pos == 1 and size == 0:
+                            values.append(None)
+                            continue
+
+                    if kind == "v2" and isinstance(desc, dict):
+                        v2_pos = desc.get("position")
+                        v2_size = desc.get("size")
+                        v2_blob_id = desc.get("blob_id")
+                        v2_uri = desc.get("blob_uri")
+                        if (
+                            v2_pos == 0
+                            and v2_size == 0
+                            and v2_blob_id == 0
+                            and (v2_uri == "" or v2_uri is None)
+                        ):
+                            values.append(None)
+                            continue
+
+                    if kind != "legacy":
+                        if isinstance(desc, bytes | bytearray | memoryview):
+                            values.append(bytes(desc))
+                            continue
+                        if isinstance(desc, dict) and "bytes" in desc:
+                            values.append(bytes(desc["bytes"]))
+                            continue
+
+                    try:
+                        blob_file = next(blob_iter)
+                    except StopIteration as exc:  # pragma: no cover
+                        raise RuntimeError(
+                            "LanceDataset.take_blobs returned fewer blobs than expected"
+                        ) from exc
+                    with blob_file as bf:
+                        values.append(bf.read())
 
             # Construct LargeBinary array for Ray, preserving legacy metadata only
             # for metadata-based blob columns. Blob v2 extension columns are exposed

@@ -15,7 +15,7 @@ from ray.data._internal.util import _check_import
 from ray.data.datasource.datasink import Datasink
 
 from .fragment import write_fragment
-from .utils import create_storage_options_provider, get_or_create_namespace
+from .utils import get_namespace_kwargs, get_or_create_namespace
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -74,7 +74,6 @@ class _BaseLanceDatasink(Datasink):
 
         if namespace is not None and table_id is not None:
             self.table_id = table_id
-            has_namespace_storage_options = False
 
             if mode == "append":
                 # For append mode, we need to get existing table URI
@@ -83,7 +82,6 @@ class _BaseLanceDatasink(Datasink):
                 self.uri = describe_response.location
                 if describe_response.storage_options:
                     merged_storage_options.update(describe_response.storage_options)
-                    has_namespace_storage_options = True
             elif mode == "overwrite":
                 # For overwrite mode, try to get existing table, fallback to declare
                 try:
@@ -92,7 +90,6 @@ class _BaseLanceDatasink(Datasink):
                     self.uri = describe_response.location
                     if describe_response.storage_options:
                         merged_storage_options.update(describe_response.storage_options)
-                        has_namespace_storage_options = True
                 except Exception:
                     uri, ns_storage_options = _declare_table_with_fallback(
                         namespace, table_id
@@ -100,7 +97,6 @@ class _BaseLanceDatasink(Datasink):
                     self.uri = uri
                     if ns_storage_options:
                         merged_storage_options.update(ns_storage_options)
-                        has_namespace_storage_options = True
             else:
                 # create mode, declare a new table
                 uri, ns_storage_options = _declare_table_with_fallback(
@@ -109,14 +105,9 @@ class _BaseLanceDatasink(Datasink):
                 self.uri = uri
                 if ns_storage_options:
                     merged_storage_options.update(ns_storage_options)
-                    has_namespace_storage_options = True
-
-            # Mark that we have namespace storage options for provider creation
-            self._has_namespace_storage_options = has_namespace_storage_options
         else:
             self.table_id = None
             self.uri = uri
-            self._has_namespace_storage_options = False
 
         self.schema = schema
         self.mode = mode
@@ -124,11 +115,9 @@ class _BaseLanceDatasink(Datasink):
         self.storage_options = merged_storage_options
 
     @property
-    def storage_options_provider(self):
-        """Lazily create storage options provider using namespace_impl/properties."""
-        if not self._has_namespace_storage_options:
-            return None
-        return create_storage_options_provider(
+    def namespace_kwargs(self) -> dict[str, Any]:
+        """Namespace wiring for pylance credential refresh."""
+        return get_namespace_kwargs(
             self._namespace_impl, self._namespace_properties, self.table_id
         )
 
@@ -145,7 +134,7 @@ class _BaseLanceDatasink(Datasink):
             ds = lance.LanceDataset(
                 self.uri,
                 storage_options=self.storage_options,
-                storage_options_provider=self.storage_options_provider,
+                **self.namespace_kwargs,
             )
             self.read_version = ds.version
             if self.schema is None:
@@ -191,7 +180,28 @@ class _BaseLanceDatasink(Datasink):
             return
         op = None
         if self.mode in {"create", "overwrite"}:
-            op = lance.LanceOperation.Overwrite(schema, fragments)
+            initial_bases = None
+            blob_v2_columns = [
+                field.name
+                for field in schema
+                if isinstance(field.type, pa.ExtensionType)
+                and getattr(field.type, "extension_name", None) == "lance.blob.v2"
+            ]
+            if blob_v2_columns:
+                initial_bases = [
+                    lance.DatasetBasePath(
+                        "file:///",
+                        name="external_file",
+                        is_dataset_root=False,
+                        id=1,
+                    )
+                ]
+
+            op = lance.LanceOperation.Overwrite(
+                schema,
+                fragments,
+                initial_bases=initial_bases,
+            )
         elif self.mode == "append":
             op = lance.LanceOperation.Append(fragments)
         if op:
@@ -200,7 +210,7 @@ class _BaseLanceDatasink(Datasink):
                 op,
                 read_version=self.read_version,
                 storage_options=self.storage_options,
-                storage_options_provider=self.storage_options_provider,
+                **self.namespace_kwargs,
             )
 
 

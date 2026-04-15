@@ -1,8 +1,9 @@
+import inspect
 import os
 import sys
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
-from typing import Optional, TypeVar
+from typing import Any, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -99,29 +100,31 @@ def get_or_create_namespace(
     return _get_cached_namespace(namespace_impl, namespace_properties_tuple)
 
 
+@lru_cache(maxsize=1)
+def _lance_namespace_kw() -> str:
+    import lance
+
+    params = inspect.signature(lance.dataset).parameters
+    if "namespace_client" in params:
+        return "namespace_client"
+    if "namespace" in params:
+        return "namespace"
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _lance_supports_storage_options_provider() -> bool:
+    import lance
+
+    params = inspect.signature(lance.dataset).parameters
+    return "storage_options_provider" in params
+
+
 def create_storage_options_provider(
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
     table_id: Optional[list[str]],
 ):
-    """Create a LanceNamespaceStorageOptionsProvider if namespace parameters are provided.
-
-    This function reconstructs a namespace connection and creates a storage options
-    provider for credential refresh in distributed workers. Workers receive serializable
-    namespace_impl/properties/table_id instead of the non-serializable namespace object.
-
-    The namespace client is cached per-worker to avoid redundant connection overhead
-    across multiple task invocations within the same Ray worker.
-
-    Args:
-        namespace_impl: The namespace implementation type (e.g., "rest", "dir").
-        namespace_properties: Properties for connecting to the namespace (can be None).
-        table_id: The table identifier as a list of strings.
-
-    Returns:
-        LanceNamespaceStorageOptionsProvider if namespace_impl and table_id are provided,
-        None otherwise.
-    """
     if not has_namespace_params(namespace_impl, table_id):
         return None
 
@@ -129,9 +132,64 @@ def create_storage_options_provider(
     if namespace is None:
         return None
 
-    from lance import LanceNamespaceStorageOptionsProvider
+    import lance
 
-    return LanceNamespaceStorageOptionsProvider(namespace=namespace, table_id=table_id)
+    if not hasattr(lance, "LanceNamespaceStorageOptionsProvider"):
+        return None
+
+    return lance.LanceNamespaceStorageOptionsProvider(namespace=namespace, table_id=table_id)
+
+
+def get_namespace_kwargs(
+    namespace_impl: Optional[str],
+    namespace_properties: Optional[dict[str, str]],
+    table_id: Optional[list[str]],
+) -> dict[str, Any]:
+    """Return kwargs for pylance namespace / auth integration.
+
+    pylance 4.0.0 uses: `namespace`, `table_id`, `storage_options_provider`.
+    Newer pylance versions may use `namespace_client` instead of `namespace`.
+
+    This helper hides those naming differences and keeps call sites simple.
+    """
+    if not has_namespace_params(namespace_impl, table_id):
+        return {}
+
+    namespace = get_or_create_namespace(namespace_impl, namespace_properties)
+    if namespace is None:
+        return {}
+
+    kwargs: dict[str, Any] = {}
+    namespace_kw = _lance_namespace_kw()
+    if namespace_kw:
+        kwargs[namespace_kw] = namespace
+    kwargs["table_id"] = table_id
+
+    if _lance_supports_storage_options_provider():
+        provider = create_storage_options_provider(
+            namespace_impl, namespace_properties, table_id
+        )
+        if provider is not None:
+            kwargs["storage_options_provider"] = provider
+
+    return kwargs
+
+
+def get_write_fragments_kwargs(
+    namespace_impl: Optional[str],
+    namespace_properties: Optional[dict[str, str]],
+    table_id: Optional[list[str]],
+) -> dict[str, Any]:
+    """Return kwargs for `lance.fragment.write_fragments`.
+
+    pylance 4.0.0 supports `storage_options_provider` on write_fragments, but not
+    `namespace` / `table_id`.
+    """
+    provider = create_storage_options_provider(namespace_impl, namespace_properties, table_id)
+    if provider is None:
+        return {}
+
+    return {"storage_options_provider": provider}
 
 
 if sys.version_info >= (3, 12):

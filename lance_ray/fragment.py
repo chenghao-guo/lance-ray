@@ -11,6 +11,7 @@ from typing import (
     Optional,
     Union,
 )
+from urllib.parse import urlparse
 
 import pyarrow as pa
 from ray.data._internal.util import call_with_retry
@@ -26,7 +27,7 @@ __all__ = [
 ]
 
 from .pandas import pd_to_arrow
-from .utils import create_storage_options_provider
+from .utils import get_write_fragments_kwargs
 
 
 def write_fragment(
@@ -48,8 +49,13 @@ def write_fragment(
     from lance.dependencies import pandas as pd
     from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, write_fragments
 
+    stream_iter = iter(stream)
+    try:
+        first = next(stream_iter)
+    except StopIteration:
+        return []
+
     if schema is None:
-        first = next(iter(stream))
         if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
             schema = pa.Schema.from_pandas(first).remove_metadata()
         elif isinstance(first, dict):
@@ -57,11 +63,11 @@ def write_fragment(
             schema = tbl.schema.remove_metadata()
         else:
             schema = first.schema
-        if len(schema.names) == 0:
-            # Empty table.
-            schema = None
 
-        stream = chain([first], stream)
+    if schema is None or len(schema.names) == 0:
+        return []
+
+    stream = chain([first], stream_iter)
 
     def record_batch_converter():
         for block in stream:
@@ -83,10 +89,54 @@ def write_fragment(
             "max_backoff_s": 0,
         }
 
-    # Create storage options provider from namespace parameters
-    storage_options_provider = create_storage_options_provider(
+    write_kwargs = get_write_fragments_kwargs(
         namespace_impl, namespace_properties, table_id
     )
+
+    blob_v2_columns = [
+        field.name
+        for field in schema
+        if isinstance(field.type, pa.ExtensionType)
+        and getattr(field.type, "extension_name", None) == "lance.blob.v2"
+    ]
+    if blob_v2_columns:
+        import inspect
+
+        try:
+            write_sig = inspect.signature(write_fragments)
+        except (AttributeError, ValueError):  # pragma: no cover
+            write_sig = None
+
+        if write_sig is not None and "allow_external_blob_outside_bases" in write_sig.parameters:
+            write_kwargs.setdefault("allow_external_blob_outside_bases", True)
+
+        tbl_first = pd_to_arrow(first, schema)
+        has_external_file_blobs = False
+        for col in blob_v2_columns:
+            for item in tbl_first.column(col).to_pylist():
+                if not isinstance(item, dict):
+                    continue
+                uri_value = item.get("uri")
+                if not uri_value:
+                    continue
+                if urlparse(uri_value).scheme == "file":
+                    has_external_file_blobs = True
+                    break
+            if has_external_file_blobs:
+                break
+
+        if has_external_file_blobs:
+            import lance
+
+            initial_bases = [
+                lance.DatasetBasePath(
+                    "file:///",
+                    name="external_file",
+                    is_dataset_root=False,
+                    id=1,
+                )
+            ]
+            write_kwargs = {**write_kwargs, "initial_bases": initial_bases}
 
     fragments = call_with_retry(
         lambda: write_fragments(
@@ -98,7 +148,7 @@ def write_fragment(
             max_bytes_per_file=max_bytes_per_file,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
-            storage_options_provider=storage_options_provider,
+            **write_kwargs,
         ),
         **retry_params,
     )

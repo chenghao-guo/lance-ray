@@ -13,7 +13,7 @@ from packaging import version
 from ray.util.multiprocessing import Pool
 
 from .utils import (
-    create_storage_options_provider,
+    get_namespace_kwargs,
     get_or_create_namespace,
     validate_uri_or_namespace,
 )
@@ -160,8 +160,7 @@ def _handle_fragment_index(
                 if fragment_id < 0 or fragment_id > 0xFFFFFFFF:
                     raise ValueError(f"Invalid fragment_id: {fragment_id}")
 
-            # Create storage options provider in worker for credentials refresh
-            storage_options_provider = create_storage_options_provider(
+            namespace_kwargs = get_namespace_kwargs(
                 namespace_impl, namespace_properties, table_id
             )
 
@@ -169,7 +168,7 @@ def _handle_fragment_index(
             dataset = LanceDataset(
                 dataset_uri,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
+                **namespace_kwargs,
             )
 
             available_fragments = {f.fragment_id for f in dataset.get_fragments()}
@@ -372,16 +371,13 @@ def create_scalar_index(
         if describe_response.storage_options:
             merged_storage_options.update(describe_response.storage_options)
 
-    # Create storage options provider for local operations
-    storage_options_provider = create_storage_options_provider(
-        namespace_impl, namespace_properties, table_id
-    )
+    namespace_kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
 
     # Load dataset
     dataset = LanceDataset(
         uri,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
     try:
@@ -423,7 +419,23 @@ def create_scalar_index(
     if name is None:
         name = f"{column}_idx"
 
-    if not replace:
+    if replace:
+        try:
+            existing_indices = dataset.list_indices()
+        except Exception:  # pragma: no cover
+            existing_indices = []
+
+        if any(idx.get("name") == name for idx in existing_indices):
+            # Lance 4.0.0: fragment_ids + replace=True may hit an unimplemented path.
+            # Implement replace semantics at the driver by dropping the index first.
+            dataset.drop_index(name)
+            dataset = LanceDataset(
+                uri,
+                storage_options=merged_storage_options,
+                **namespace_kwargs,
+            )
+
+    else:
         index_exists = False
         try:
             existing_indices = dataset.list_indices()
@@ -465,7 +477,7 @@ def create_scalar_index(
         index_type=index_type,
         name=name,
         index_uuid=index_id,
-        replace=replace,
+        replace=False,
         train=train,
         storage_options=merged_storage_options,
         namespace_impl=namespace_impl,
@@ -497,7 +509,7 @@ def create_scalar_index(
     dataset = LanceDataset(
         uri,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
     logger.info("Phase 2: Merging index metadata for index ID: %s", index_id)
@@ -530,7 +542,7 @@ def create_scalar_index(
         create_index_op,
         read_version=dataset.version,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
     logger.info(
@@ -659,14 +671,13 @@ def _handle_vector_fragment_index(
                 if fragment_id < 0 or fragment_id > 0xFFFFFFFF:
                     raise ValueError(f"Invalid fragment_id: {fragment_id}")
 
-            # Create storage options provider in worker for credentials refresh
-            storage_options_provider = create_storage_options_provider(
+            namespace_kwargs = get_namespace_kwargs(
                 namespace_impl, namespace_properties, table_id
             )
             dataset = LanceDataset(
                 dataset_uri,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
+                **namespace_kwargs,
             )
             available_fragments = {f.fragment_id for f in dataset.get_fragments()}
             invalid_fragments = set(fragment_ids) - available_fragments
@@ -679,7 +690,7 @@ def _handle_vector_fragment_index(
                 fragment_ids,
             )
 
-            dataset.create_index(
+            segment_index = dataset.create_index_uncommitted(
                 column=column,
                 index_type=index_type,
                 name=name,
@@ -692,14 +703,8 @@ def _handle_vector_fragment_index(
                 storage_options=storage_options,
                 train=True,
                 fragment_ids=fragment_ids,
-                index_uuid=index_uuid,
                 **kwargs,
             )
-
-            lance_field = dataset.lance_schema.field(column)
-            if lance_field is None:
-                raise KeyError(f"{column} not found in schema")
-            field_id = lance_field.id()
 
             logger.info(
                 "Fragment vector index created successfully for fragments %s",
@@ -709,8 +714,8 @@ def _handle_vector_fragment_index(
             return {
                 "status": "success",
                 "fragment_ids": fragment_ids,
-                "fields": [field_id],
-                "uuid": index_uuid,
+                "segment_index": segment_index,
+                "uuid": getattr(segment_index, "uuid", index_uuid),
             }
 
         except Exception as exc:  # pragma: no cover - exercised via integration tests
@@ -812,13 +817,13 @@ def create_index(
                 merged_storage_options.update(describe_response.storage_options)
 
         dataset_uri = uri
-        storage_options_provider = create_storage_options_provider(
+        namespace_kwargs = get_namespace_kwargs(
             namespace_impl, namespace_properties, table_id
         )
         dataset_obj = LanceDataset(
             dataset_uri,
             storage_options=merged_storage_options,
-            storage_options_provider=storage_options_provider,
+            **namespace_kwargs,
         )
     else:
         # LanceDataset object passed directly
@@ -826,7 +831,7 @@ def create_index(
         dataset_uri = dataset_obj.uri
         if not merged_storage_options:
             merged_storage_options = getattr(dataset_obj, "_storage_options", None) or {}
-        storage_options_provider = None
+        namespace_kwargs = {}
 
     try:
         dataset_obj.schema.field(column)
@@ -881,17 +886,15 @@ def create_index(
     num_rows = dataset_obj.count_rows()
     dimension = builder.dimension
 
-    computed_num_partitions = builder._determine_num_partitions(
-        num_partitions, num_rows
-    )
+    requested_num_partitions = num_partitions
     logger.info(
-        "Training IVF with num_partitions=%d, num_rows=%d, dimension=%d",
-        computed_num_partitions,
+        "Training IVF with requested_num_partitions=%s, num_rows=%d, dimension=%d",
+        requested_num_partitions,
         num_rows,
         dimension,
     )
     ivf_model = builder.train_ivf(
-        num_partitions=computed_num_partitions,
+        num_partitions=requested_num_partitions,
         distance_type=metric_lower,
     )
     ivf_centroids_artifact = ivf_model.centroids
@@ -902,21 +905,19 @@ def create_index(
     )
 
     if needs_pq:
-        computed_num_sub_vectors = builder._normalize_pq_params(
-            num_sub_vectors, dimension
-        )
+        requested_num_sub_vectors = num_sub_vectors
         logger.info(
-            "Training PQ codebook: num_sub_vectors=%d, sample_rate=%d",
-            computed_num_sub_vectors,
+            "Training PQ codebook: requested_num_sub_vectors=%s, sample_rate=%d",
+            requested_num_sub_vectors,
             kwargs.get("sample_rate", 256),
         )
         pq_model = builder.train_pq(
             ivf_model,
-            computed_num_sub_vectors,
+            num_subvectors=requested_num_sub_vectors,
             sample_rate=kwargs.get("sample_rate", 256),
         )
         pq_codebook_artifact = pq_model.codebook
-        num_sub_vectors = computed_num_sub_vectors
+        num_sub_vectors = pq_model.num_subvectors
         logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
 
     if ivf_centroids_artifact is None:
@@ -976,49 +977,32 @@ def create_index(
     dataset_obj = LanceDataset(
         dataset_uri,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
 
-    logger.info("Phase 3: Merging index metadata for index ID: %s", index_id)
-    merge_index_metadata_compat(
-        dataset_obj,
-        index_id,
-        index_type=index_type_name,
-        **kwargs,
+    logger.info(
+        "Phase 3: Building and committing index segments for vector index '%s'",
+        name,
     )
-
-    logger.info("Phase 4: Creating and committing vector index '%s'", name)
 
     successful_results = [r for r in results if r.get("status") == "success"]
     if not successful_results:
         raise RuntimeError("No successful vector index creation results found")
 
-    fields = successful_results[0]["fields"]
-
-    index = Index(
-        uuid=index_id,
-        name=name,
-        fields=fields,
-        dataset_version=dataset_obj.version,
-        fragment_ids=set(fragment_ids_to_use),
-        index_version=0,
+    segment_indices = [r["segment_index"] for r in successful_results]
+    segment_builder = dataset_obj.create_index_segment_builder().with_segments(
+        segment_indices
     )
+    segments = segment_builder.build_all()
 
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=[],
-    )
-
-    updated_dataset = lance.LanceDataset.commit(
-        dataset_uri,
-        create_index_op,
-        read_version=dataset_obj.version,
-        storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+    updated_dataset = dataset_obj.commit_existing_index_segments(
+        index_name=name,
+        column=column,
+        segments=segments,
     )
 
     logger.info(
-        "Successfully created distributed vector index '%s' with multi-phase workflow",
+        "Successfully created distributed vector index '%s'",
         name,
     )
     logger.info(
@@ -1123,14 +1107,12 @@ def optimize_indices(
             uri,
         )
 
-    storage_options_provider = create_storage_options_provider(
-        namespace_impl, namespace_properties, table_id
-    )
+    namespace_kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
 
     dataset = LanceDataset(
         uri,
         storage_options=merged_storage_options,
-        storage_options_provider=storage_options_provider,
+        **namespace_kwargs,
     )
     logger.info(
         "Loaded dataset: uri=%s, version=%s",
